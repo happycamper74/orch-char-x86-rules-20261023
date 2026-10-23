@@ -23,6 +23,10 @@ if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
   echo "ENV_REJECTED not_linux_x86_64"
   exit 2
 fi
+echo "SYSCTL"
+for p in /proc/sys/abi/ia32_emulation /proc/sys/kernel/ia32_emulation /proc/sys/abi/x32 /proc/sys/kernel/x32; do
+  if [ -e "$p" ]; then echo "SYSCTL $p $(cat "$p" 2>/dev/null || echo unreadable)"; fi
+done
 echo "KERNEL_CONFIG"
 cfg="/boot/config-$(uname -r)"
 if [ -f "$cfg" ]; then
@@ -39,10 +43,28 @@ echo "PARSER_RC $parser_rc"
 gcc -O2 -Wall -o abi abi.c -lseccomp
 abi_build=$?
 echo "ABI_BUILD $abi_build"
+abi_rc=1
 if [ "$abi_build" -eq 0 ]; then
+  set +e
   ./abi
-  echo "ABI_RC $?"
+  abi_rc=$?
+  set -e
+  echo "ABI_RC $abi_rc"
 fi
-if [ "$parser_rc" -ne 0 ] || [ "$abi_build" -ne 0 ]; then
+ia32_sysctl=""
+for p in /proc/sys/abi/ia32_emulation /proc/sys/kernel/ia32_emulation; do
+  if [ -e "$p" ]; then ia32_sysctl=$p; break; fi
+done
+if [ -n "$ia32_sysctl" ] && [ "$(cat "$ia32_sysctl")" = "0" ]; then
+  echo "IA32_SYSCTL_ENABLE $ia32_sysctl"
+  echo 1 | sudo tee "$ia32_sysctl" >/dev/null
+  echo "SYSCTL_AFTER $(cat "$ia32_sysctl")"
+  set +e
+  ./abi
+  echo "ABI_RC_IA32_ENABLED $?"
+  set -e
+  echo 0 | sudo tee "$ia32_sysctl" >/dev/null || true
+fi
+if [ "$parser_rc" -ne 0 ] || [ "$abi_build" -ne 0 ] || [ "$abi_rc" -gt 128 ]; then
   exit 1
 fi

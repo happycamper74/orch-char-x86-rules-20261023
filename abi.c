@@ -31,38 +31,38 @@ static long raw_syscall(long nr) {
     return ret;
 }
 
-static int ia32_syscall(int nr, int arg1, int arg2, int *eax_out) {
-    struct sigaction sa, old;
+static unsigned char alt_stack[1 << 16];
+
+static int install_fault_handlers(void) {
+    stack_t ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.ss_sp = alt_stack;
+    ss.ss_size = sizeof(alt_stack);
+    if (sigaltstack(&ss, NULL) < 0) return -1;
+    struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGSEGV, &sa, &old) < 0) return -1;
-    if (sigaction(SIGILL, &sa, NULL) < 0) return -1;
-    jump_signal = 0;
-    if (sigsetjmp(jump_buffer, 1) != 0) {
-        sigaction(SIGSEGV, &old, NULL);
-        sigaction(SIGILL, &old, NULL);
-        return jump_signal;
+    sa.sa_flags = SA_ONSTACK | SA_NODEFER;
+    int signals[] = {SIGSEGV, SIGILL, SIGBUS, SIGSYS};
+    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+        if (sigaction(signals[i], &sa, NULL) < 0) return -1;
     }
-    int ret = 0;
-    int number = nr;
-    int a1 = arg1;
-    int a2 = arg2;
-    asm volatile(
-        "pushq %%rbx\n\t"
-        "movl %[nr], %%eax\n\t"
-        "movl %[a1], %%ebx\n\t"
-        "movl %[a2], %%ecx\n\t"
-        "int $0x80\n\t"
-        "movl %%eax, %[ret]\n\t"
-        "popq %%rbx\n\t"
-        : [ret] "=m"(ret)
-        : [nr] "m"(number), [a1] "m"(a1), [a2] "m"(a2)
-        : "rax", "rcx", "memory", "cc");
-    sigaction(SIGSEGV, &old, NULL);
-    sigaction(SIGILL, &old, NULL);
+    return 0;
+}
+
+static int ia32_raw(int nr, int arg1, int arg2, int *eax_out) {
+    jump_signal = 0;
+    if (sigsetjmp(jump_buffer, 0) != 0) return jump_signal;
+    int ret;
+    asm volatile("int $0x80" : "=a"(ret) : "a"(nr), "b"(arg1), "c"(arg2) : "memory", "cc");
     *eax_out = ret;
     return 0;
+}
+
+static int ia32_syscall(int nr, int arg1, int arg2, int *eax_out) {
+    if (install_fault_handlers() < 0) return -1;
+    return ia32_raw(nr, arg1, arg2, eax_out);
 }
 
 static int allow_basics(scmp_filter_ctx ctx) {
@@ -250,27 +250,6 @@ static void compat_probes(void) {
     printf("X32_GETPID rax=%ld libc_pid=%d enosys=%d match=%d\n", x32, libc_pid, x32 == -38, x32 == libc_pid);
 }
 
-static int ia32_invoke(int nr, int arg1, int arg2, int *eax_out) {
-    if (sigsetjmp(jump_buffer, 1) != 0) return jump_signal;
-    int ret = 0;
-    int number = nr;
-    int a1 = arg1;
-    int a2 = arg2;
-    asm volatile(
-        "pushq %%rbx\n\t"
-        "movl %[nr], %%eax\n\t"
-        "movl %[a1], %%ebx\n\t"
-        "movl %[a2], %%ecx\n\t"
-        "int $0x80\n\t"
-        "movl %%eax, %[ret]\n\t"
-        "popq %%rbx\n\t"
-        : [ret] "=m"(ret)
-        : [nr] "m"(number), [a1] "m"(a1), [a2] "m"(a2)
-        : "rax", "rcx", "memory", "cc");
-    *eax_out = ret;
-    return 0;
-}
-
 static void ia32_socketcall(void) {
     int eax = 0;
     int sig = ia32_syscall(102, 1, 0, &eax);
@@ -279,12 +258,7 @@ static void ia32_socketcall(void) {
 
     pid_t kid = fork();
     if (kid == 0) {
-        struct sigaction sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = on_signal;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGSEGV, &sa, NULL);
-        sigaction(SIGILL, &sa, NULL);
+        if (install_fault_handlers() < 0) _exit(2);
         scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ERRNO(222));
         if (seccomp_arch_add(ctx, SCMP_ARCH_X86) < 0) {
             printf("IA32_ARCH_ADD errno=%d\n", errno);
@@ -295,7 +269,7 @@ static void ia32_socketcall(void) {
         fflush(stdout);
         if (seccomp_load(ctx) < 0) _exit(2);
         int filtered = 0;
-        int filtered_sig = ia32_invoke(102, 1, 0, &filtered);
+        int filtered_sig = ia32_raw(102, 1, 0, &filtered);
         if (filtered_sig > 0) printf("IA32_SOCKETCALL_FILTERED signal=%d\n", filtered_sig);
         else printf("IA32_SOCKETCALL_FILTERED eax=%d\n", filtered);
         fflush(stdout);
